@@ -1,10 +1,16 @@
 import json
 import boto3
 from datetime import datetime
+import base64
+import logging
 
 # Inicializar clientes de AWS
 timestream_write = boto3.client('timestream-write')
 s3 = boto3.client('s3')
+
+# Configurar logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Definir bases de datos y tablas
 DATABASE_NAME = 'my_timestream_db'
@@ -16,8 +22,22 @@ TABLES = {
 
 def lambda_handler(event, context):
     for record in event['Records']:
-        payload = json.loads(record['kinesis']['data'])
-        record_type = payload.pop('recordType')  # Obtener el tipo de registro
+
+         # Decodificar los datos de Kinesis
+        payload_data = base64.b64decode(record['kinesis']['data'])
+        payload_str = payload_data.decode('utf-8')
+        logger.info(f"Decoded payload: {payload_str}")
+
+        try:
+            payload = json.loads(payload_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSONDecodeError: {e}")
+            continue
+
+        record_type = payload.pop('recordType', None)
+        if not record_type:
+            logger.error("No recordType found in payload")
+            continue
 
         if record_type == 'bcvposlogdetail':
             upsert_record(payload, TABLES['bcvposlogdetail'])
@@ -25,6 +45,8 @@ def lambda_handler(event, context):
             upsert_record(payload, TABLES['bcvposlogtransaction'])
         elif record_type == 'bcvposlogheader':
             upsert_record(payload, TABLES['bcvposlogheader'])
+        else:
+            logger.error(f"Unknown recordType: {record_type}")
 
     return 'Processed {} records.'.format(len(event['Records']))
 
