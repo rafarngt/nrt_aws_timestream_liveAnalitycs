@@ -1,8 +1,9 @@
 import json
 import boto3
-from datetime import datetime
 import base64
 import logging
+from datetime import datetime
+import time
 
 # Inicializar clientes de AWS
 timestream_write = boto3.client('timestream-write')
@@ -20,14 +21,46 @@ TABLES = {
     'bcvposlogheader': 'bcvposlogheader_table'
 }
 
+DEFAULT_INT_VALUE = 0  # Valor por defecto si el valor es None
+
+def _print_rejected_records_exceptions(err):
+    logger.error(f"RejectedRecords: {err}")
+    for rr in err.response["RejectedRecords"]:
+        recordIndex=rr['RecordIndex']
+        reason=rr['Reason']
+        logger.error(f"Rejected Index {recordIndex} due to {reason}")
+        if "ExistingVersion" in rr:
+            existingVersion = rr["ExistingVersion"]
+            logger.error(f"Rejected record existing version: {existingVersion}")
+
+def _current_milli_time():
+    return str(int(round(time.time() * 1000)))
+
+def write_records(table_name, records):
+    # Escribir registros en la tabla
+    try:
+        result= timestream_write.write_records(
+            DatabaseName=DATABASE_NAME,
+            TableName=table_name,
+            Records=records,
+            CommonAttributes={}
+        )
+        logger.info(f"Upsert successful for record in table {table_name}")
+        logger.info(f"WriteRecords Status:  { result['ResponseMetadata']['HTTPStatusCode']}")
+
+    except timestream_write.exceptions.RejectedRecordsException as e:
+        _print_rejected_records_exceptions(e)
+    except Exception as e:
+        logger.error(f"Error during upsert: {e}")
+
 def lambda_handler(event, context):
     for record in event['Records']:
-
-         # Decodificar los datos de Kinesis
+        # Decodificar los datos de Kinesis
         payload_data = base64.b64decode(record['kinesis']['data'])
         payload_str = payload_data.decode('utf-8')
+        
         logger.info(f"Decoded payload: {payload_str}")
-
+        
         try:
             payload = json.loads(payload_str)
         except json.JSONDecodeError as e:
@@ -50,12 +83,41 @@ def lambda_handler(event, context):
 
     return 'Processed {} records.'.format(len(event['Records']))
 
+def convert_to_int(value, default=DEFAULT_INT_VALUE):
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            # Asumir que el formato es una fecha/hora y convertirla a timestamp
+            dt = datetime.fromisoformat(value)
+            tmp = int(dt.timestamp())
+            logger.info(f"Decoded payload: {tmp}")
+            return int(dt.timestamp())
+        except ValueError:
+            logger.error(f"Error converting {value} to timestamp")
+            return default
+    return int(value)
+
 def upsert_record(payload, table_name):
     # Convertir fecha a timestamp
-    op_date = datetime.strptime(payload['OpDate'], '%Y-%m-%d %H:%M:%S.%f')
-    current_time = str(int(op_date.timestamp() * 1000))
+    try:
+        op_date = datetime.strptime(payload['OpDate'], '%Y-%m-%d %H:%M:%S.%f')
+        op_date_time = str(int(op_date.timestamp() * 1000))
+        
+    except KeyError as e:
+        logger.error(f"Missing key in payload: {e}")
+        return
+    except ValueError as e:
+        logger.error(f"Date conversion error: {e}")
+        return
     
     # Determinar dimensiones y medidas en función del tipo de registro
+    dimensions = []
+    measures = []
+    
+    current_timestamp = _current_milli_time()
+    logger.info(f"Timestamp: {current_timestamp}")
+
     if table_name == 'bcvposlogdetail_table':
         dimensions = [
             {'Name': 'IdPOSLogDetail', 'Value': str(payload['IdPOSLogDetail'])},
@@ -65,25 +127,41 @@ def upsert_record(payload, table_name):
             {'Name': 'StreamPosition', 'Value': str(payload['StreamPosition'])},
             {'Name': 'IdBCVProcessInfo', 'Value': str(payload['IdBCVProcessInfo'])},
             {'Name': 'IdPOSLogDetailStatus', 'Value': str(payload['IdPOSLogDetailStatus'])},
-            {'Name': 'DepurationProcessId', 'Value': str(payload['DepurationProcessId'])}
+            {'Name': 'DepurationProcessId', 'Value': str(payload['DepurationProcessId'])},
+
         ]
-        measures = [
+        
+        records = [
             {
-                'MeasureName': 'SendTs',
-                'MeasureValue': str(payload['SendTs']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'ReceivedTs',
-                'MeasureValue': str(payload['ReceivedTs']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'ProcessedTs',
-                'MeasureValue': str(payload['ProcessedTs']),
-                'MeasureValueType': 'BIGINT'
+                'Dimensions': dimensions,
+                'MeasureName': 'OpDate', 
+                'MeasureValue': op_date_time, 
+                'MeasureValueType': 'BIGINT',
+                'Time': current_timestamp
+            },{
+                'Dimensions': dimensions,
+                'MeasureName': 'SendTs', 
+                'MeasureValue': str(convert_to_int(payload.get('SendTs'))), 
+                'MeasureValueType': 'BIGINT',
+                'Time': current_timestamp
+            },{
+                'Dimensions': dimensions,
+                'MeasureName': 'ReceivedTs', 
+                'MeasureValue': str(convert_to_int(payload.get('ReceivedTs'))), 
+                'MeasureValueType': 'BIGINT',
+                'Time': current_timestamp
+            },{
+                'Dimensions': dimensions,
+                'MeasureName': 'ProcessedTs', 
+                'MeasureValue': str(convert_to_int(payload.get('ProcessedTs'))), 
+                'MeasureValueType': 'BIGINT',
+                'Time': current_timestamp
             }
         ]
+        logger.info(f"measures: {records}")
+        write_records(table_name, records)
+
+        
     elif table_name == 'bcvposlogtransaction_table':
         dimensions = [
             {'Name': 'ID', 'Value': str(payload['ID'])},
@@ -100,16 +178,8 @@ def upsert_record(payload, table_name):
             {'Name': 'SAPStore', 'Value': payload['SAPStore']}
         ]
         measures = [
-            {
-                'MeasureName': 'BeginDateTime',
-                'MeasureValue': str(payload['BeginDateTime']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'EndDateTime',
-                'MeasureValue': str(payload['EndDateTime']),
-                'MeasureValueType': 'BIGINT'
-            }
+            {'MeasureName': 'BeginDateTime', 'MeasureValue': str(convert_to_int(payload.get('BeginDateTime'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'EndDateTime', 'MeasureValue': str(convert_to_int(payload.get('EndDateTime'))), 'MeasureValueType': 'BIGINT'}
         ]
     elif table_name == 'bcvposlogheader_table':
         dimensions = [
@@ -118,67 +188,12 @@ def upsert_record(payload, table_name):
             {'Name': 'IdPOSLogHeaderStatus', 'Value': str(payload['IdPOSLogHeaderStatus'])}
         ]
         measures = [
-            {
-                'MeasureName': 'POSLogBusinessDate',
-                'MeasureValue': str(payload['POSLogBusinessDate']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'POSLogEndOfBusinessDate',
-                'MeasureValue': str(payload['POSLogEndOfBusinessDate']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'StartProcessTs',
-                'MeasureValue': str(payload['StartProcessTs']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'EndProcessTs',
-                'MeasureValue': str(payload['EndProcessTs']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'ValidatedTxQty',
-                'MeasureValue': str(payload['ValidatedTxQty']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'TotalTxQty',
-                'MeasureValue': str(payload['TotalTxQty']),
-                'MeasureValueType': 'BIGINT'
-            },
-            {
-                'MeasureName': 'CloseProcessTs',
-                'MeasureValue': str(payload['CloseProcessTs']),
-                'MeasureValueType': 'BIGINT'
-            }
+            {'MeasureName': 'POSLogBusinessDate', 'MeasureValue': str(convert_to_int(payload.get('POSLogBusinessDate'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'POSLogEndOfBusinessDate', 'MeasureValue': str(convert_to_int(payload.get('POSLogEndOfBusinessDate'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'StartProcessTs', 'MeasureValue': str(convert_to_int(payload.get('StartProcessTs'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'EndProcessTs', 'MeasureValue': str(convert_to_int(payload.get('EndProcessTs'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'ValidatedTxQty', 'MeasureValue': str(convert_to_int(payload.get('ValidatedTxQty'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'TotalTxQty', 'MeasureValue': str(convert_to_int(payload.get('TotalTxQty'))), 'MeasureValueType': 'BIGINT'},
+            {'MeasureName': 'CloseProcessTs', 'MeasureValue': str(convert_to_int(payload.get('CloseProcessTs'))), 'MeasureValueType': 'BIGINT'}
         ]
-    
-    try:
-        # Escribir en Timestream
-        timestream_write.write_records(
-            DatabaseName=DATABASE_NAME,
-            TableName=table_name,
-            Records=[
-                {
-                    'Dimensions': dimensions,
-                    'MeasureName': measures[0]['MeasureName'],
-                    'MeasureValue': measures[0]['MeasureValue'],
-                    'MeasureValueType': measures[0]['MeasureValueType'],
-                    'Time': current_time
-                }
-            ]
-        )
-        print(f"Upsert successful for record in table {table_name}")
-
-        # Guardar en S3
-        #s3.put_object(
-        #    Bucket='my-s3-bucket',
-        #    Key=f"raw/{current_time}.json",
-        #    Body=json.dumps(payload)
-        #)
-
-    except Exception as e:
-        print(f"Error during upsert: {e}")
 
