@@ -54,6 +54,8 @@ def write_records(table_name, records):
         logger.error(f"Error during upsert: {e}")
 
 def lambda_handler(event, context):
+    logger.info(f"Received event: {json.dumps(event)}")
+    return
     for record in event['Records']:
         # Decodificar los datos de Kinesis
         payload_data = base64.b64decode(record['kinesis']['data'])
